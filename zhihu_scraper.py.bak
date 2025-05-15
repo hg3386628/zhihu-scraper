@@ -1,0 +1,1307 @@
+import asyncio
+import os
+import re
+import time
+import argparse
+import json
+import random
+import platform
+from datetime import datetime
+from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
+import aiofiles
+
+try:
+    from browser_use import Agent, Browser, BrowserConfig
+    from langchain_openai import ChatOpenAI
+    from langchain_deepseek import ChatDeepSeek
+    from dotenv import load_dotenv
+    browser_use_available = True
+except ImportError:
+    browser_use_available = False
+    print("提示: browser-use库未安装，将使用直接浏览器模式。如需使用AI代理，请安装browser-use: pip install browser-use playwright")
+
+class ZhihuBrowserScraper:
+    """知乎浏览器爬虫 - 支持两种模式:
+    1. AI代理模式: 使用browser-use包通过AI控制浏览器
+    2. 手动浏览器模式: 直接使用Playwright控制浏览器"""
+    
+    def __init__(self, api_key=None, model_name="gpt-4o", zhihu_cookie=None):
+        """初始化爬虫
+        Args:
+            api_key: API密钥 (AI代理模式需要)，如不提供将尝试从环境变量加载
+            model_name: 使用的语言模型，默认gpt-4o
+            zhihu_cookie: 可选的知乎cookie用于登录状态
+        """
+        # 加载环境变量
+        load_dotenv()
+        
+        # 如果未提供cookie，尝试从环境变量中获取
+        if zhihu_cookie is None:
+            zhihu_cookie = os.getenv("ZHIHU_COOKIE_FULL")
+            if zhihu_cookie:
+                print("使用环境变量中的ZHIHU_COOKIE_FULL")
+            else:
+                zhihu_cookie_z_c0 = os.getenv("ZHIHU_COOKIE_Z_C0")
+                if zhihu_cookie_z_c0:
+                    print("使用环境变量中的ZHIHU_COOKIE_Z_C0")
+                    zhihu_cookie = f"z_c0={zhihu_cookie_z_c0}"
+        
+        self.zhihu_cookie = zhihu_cookie
+        self.chrome_path = self._detect_chrome_path()
+        
+        # 初始化AI代理相关组件 (如果browser_use可用)
+        if browser_use_available:
+            # 如果未提供API密钥，尝试从环境变量中获取
+            if not api_key:
+                # 检查多种可能的API密钥环境变量
+                if os.getenv("DEEPSEEK_API_KEY"):
+                    print("使用环境变量中的DEEPSEEK_API_KEY")
+                    api_key = os.getenv("DEEPSEEK_API_KEY")
+                    if model_name == "gpt-4o":
+                        model_name = "deepseek-chat"  # 使用默认DeepSeek模型
+                elif os.getenv("OPENAI_API_KEY"):
+                    print("使用环境变量中的OPENAI_API_KEY")
+                    api_key = os.getenv("OPENAI_API_KEY")
+                elif os.getenv("ANTHROPIC_API_KEY"):
+                    print("使用环境变量中的ANTHROPIC_API_KEY")
+                    api_key = os.getenv("ANTHROPIC_API_KEY")
+                    if model_name == "gpt-4o":
+                        model_name = "claude-3-opus"  # 使用默认Claude模型
+                elif os.getenv("GOOGLE_API_KEY"):
+                    print("使用环境变量中的GOOGLE_API_KEY")
+                    api_key = os.getenv("GOOGLE_API_KEY")
+                    if model_name == "gpt-4o":
+                        model_name = "gemini-pro"  # 使用默认Gemini模型
+            
+            # 如果成功获取API密钥，初始化LLM
+            if api_key:
+                self.api_key = api_key
+                try:
+                    # 根据模型名称选择合适的LLM
+                    if model_name.startswith(("gpt-", "text-")):
+                        from langchain_openai import ChatOpenAI
+                        self.llm = ChatOpenAI(model=model_name, api_key=api_key)
+                    elif model_name.startswith("deepseek-"):
+                        from langchain_deepseek import ChatDeepSeek
+                        self.llm = ChatDeepSeek(model=model_name, api_key=api_key)
+                    elif model_name.startswith("claude-"):
+                        from langchain_anthropic import ChatAnthropic
+                        self.llm = ChatAnthropic(model=model_name, api_key=api_key)
+                    elif model_name.startswith(("gemini-", "models/gemini-")):
+                        from langchain_google_genai import ChatGoogleGenerativeAI
+                        self.llm = ChatGoogleGenerativeAI(model=model_name, api_key=api_key)
+                    else:
+                        # 默认使用可用的第一个API key
+                        if os.getenv("DEEPSEEK_API_KEY"):
+                            from langchain_deepseek import ChatDeepSeek
+                            self.llm = ChatDeepSeek(model="deepseek-chat", api_key=api_key)
+                        else:
+                            from langchain_openai import ChatOpenAI
+                            self.llm = ChatOpenAI(model="gpt-4o", api_key=api_key)
+                    
+                    print(f"AI代理模式初始化成功，使用模型: {model_name}")
+                except Exception as e:
+                    print(f"警告: AI代理模式初始化失败: {e}")
+                    self.llm = None
+            else:
+                print("AI代理模式不可用: 未提供API密钥，环境变量中也未找到")
+                self.api_key = None
+                self.llm = None
+        else:
+            print("AI代理模式不可用: browser-use库未安装")
+            self.api_key = None
+            self.llm = None
+    
+    def _detect_chrome_path(self):
+        """自动检测Chromium浏览器路径"""
+        chrome_path = None
+        
+        # 检测系统类型
+        system = platform.system()
+        
+        if system == "Darwin":  # macOS
+            default_paths = [
+                "/Applications/Chromium.app/Contents/MacOS/Chromium",
+                "~/Applications/Chromium.app/Contents/MacOS/Chromium"
+            ]
+            for path in default_paths:
+                expanded_path = os.path.expanduser(path)
+                if os.path.exists(expanded_path):
+                    chrome_path = expanded_path
+                    break
+        
+        elif system == "Windows":
+            default_paths = [
+                "C:\\Program Files\\Chromium\\Application\\chromium.exe",
+                "C:\\Program Files (x86)\\Chromium\\Application\\chromium.exe"
+            ]
+            for path in default_paths:
+                if os.path.exists(path):
+                    chrome_path = path
+                    break
+        
+        elif system == "Linux":
+            # 在Linux上尝试使用which命令
+            import subprocess
+            try:
+                chrome_path = subprocess.check_output(["which", "chromium"]).decode("utf-8").strip()
+            except:
+                try:
+                    chrome_path = subprocess.check_output(["which", "chromium-browser"]).decode("utf-8").strip()
+                except:
+                    # 在常见路径中查找
+                    default_paths = [
+                        "/usr/bin/chromium",
+                        "/usr/bin/chromium-browser"
+                    ]
+                    for path in default_paths:
+                        if os.path.exists(path):
+                            chrome_path = path
+                            break
+        
+        if chrome_path:
+            print(f"已检测到Chromium浏览器: {chrome_path}")
+        else:
+            print("警告: 未检测到Chromium浏览器，将使用默认浏览器设置")
+        
+        return chrome_path
+    
+    async def _launch_browser_manually(self, question_id, output_dir='output'):
+        """使用手动浏览器模式爬取知乎问题数据
+        这种模式将使用Playwright直接控制浏览器，实现更精确的浏览器指纹管理
+        """
+        if not browser_use_available and self.llm is None:
+            print("警告: AI代理模式不可用，直接使用手动浏览器模式")
+        
+        print("启动手动浏览器模式...")
+        question_url = f"https://www.zhihu.com/question/{question_id}"
+        output_file = os.path.join(output_dir, f"zhihu_question_{question_id}.json")
+        
+        # 确保输出目录存在
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 为当前问题创建专属文件夹
+        question_dir = os.path.join(output_dir, str(question_id))
+        if not os.path.exists(question_dir):
+            os.makedirs(question_dir)
+        
+        # 解析cookie为字典形式
+        cookies = []
+        if self.zhihu_cookie:
+            cookie_parts = self.zhihu_cookie.split(';')
+            for part in cookie_parts:
+                if '=' in part:
+                    name, value = part.strip().split('=', 1)
+                    if name and value:
+                        for domain in [".zhihu.com", "www.zhihu.com", "zhihu.com"]:
+                            cookies.append({
+                                "name": name,
+                                "value": value,
+                                "domain": domain,
+                                "path": "/"
+                            })
+        
+            # 确保至少添加z_c0和SESSIONID cookie（知乎的主要身份验证cookie）
+            # 处理z_c0
+            if "z_c0" in self.zhihu_cookie:
+                z_c0_value = re.search(r'z_c0=([^;]+)', self.zhihu_cookie)
+                if z_c0_value:
+                    for domain in [".zhihu.com", "www.zhihu.com", "zhihu.com"]:
+                        cookies.append({
+                            "name": "z_c0",
+                            "value": z_c0_value.group(1),
+                            "domain": domain,
+                            "path": "/",
+                            "secure": True,
+                            "httpOnly": True
+                        })
+            
+            # 处理SESSIONID
+            if "SESSIONID" in self.zhihu_cookie:
+                session_value = re.search(r'SESSIONID=([^;]+)', self.zhihu_cookie)
+                if session_value:
+                    for domain in [".zhihu.com", "www.zhihu.com", "zhihu.com"]:
+                        cookies.append({
+                            "name": "SESSIONID",
+                            "value": session_value.group(1),
+                            "domain": domain,
+                            "path": "/",
+                            "secure": True,
+                            "httpOnly": True
+                        })
+            
+            # 如果cookie字符串中没有SESSIONID，但提供了z_c0，可以尝试生成一个
+            if "SESSIONID" not in self.zhihu_cookie and "z_c0" in self.zhihu_cookie:
+                # 生成一个随机的SESSIONID
+                import uuid
+                session_id = str(uuid.uuid4()).replace("-", "")
+                for domain in [".zhihu.com", "www.zhihu.com", "zhihu.com"]:
+                    cookies.append({
+                        "name": "SESSIONID",
+                        "value": session_id,
+                        "domain": domain,
+                        "path": "/",
+                        "secure": True,
+                        "httpOnly": True
+                    })
+                print(f"生成随机SESSIONID: {session_id[:8]}...")
+
+        # 添加必要的cookie处理代码
+        print(f"添加cookie数量: {len(cookies)}")
+        
+        # 随机化窗口大小以增加真实感
+        width = 1920 + random.randint(-100, 100)
+        height = 1080 + random.randint(-50, 50)
+        
+        # 增强的浏览器启动参数，更全面的反自动化检测
+        browser_args = [
+            '--disable-blink-features=AutomationControlled',
+            '--disable-features=IsolateOrigins,site-per-process',
+            '--disable-site-isolation-trials',
+            f'--window-size={width},{height}',
+            '--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chromium/136.0.0.0 Safari/537.36'
+        ]
+        
+        # 自定义浏览器启动参数，模拟真实Chromium浏览器
+        async with async_playwright() as p:
+            # 创建浏览器上下文，添加高级指纹特征
+            browser = await p.chromium.launch(
+                headless=False,  # 使用有头模式，方便排查问题
+                slow_mo=100 + random.randint(0, 100),  # 随机化操作速度
+                args=browser_args
+            )
+            
+            # 创建上下文，更完整的浏览器环境配置
+            context = await browser.new_context(
+                viewport={"width": width, "height": height},
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chromium/136.0.0.0 Safari/537.36",
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
+                accept_downloads=True,
+                extra_http_headers={
+                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                    "accept-encoding": "gzip, deflate, br, zstd",
+                    "accept-language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7,zh-CN;q=0.6",
+                    "cache-control": "no-cache",
+                    "pragma": "no-cache",
+                    "sec-ch-ua": '"Chromium";v="136", "Not.A/Brand";v="99"',
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": '"macOS"',
+                    "sec-fetch-dest": "document",
+                    "sec-fetch-mode": "navigate",
+                    "sec-fetch-site": "none",
+                    "sec-fetch-user": "?1",
+                    "upgrade-insecure-requests": "1"
+                }
+            )
+            
+            # 设置cookies
+            await context.add_cookies(cookies)
+            
+            # 使用CDP直接设置cookie（更可靠的方法）
+            if self.zhihu_cookie and len(self.zhihu_cookie) > 0:
+                print("使用CDP直接设置cookie...")
+                cdp_session = await context.new_cdp_session(await context.new_page())
+                
+                # 解析cookie字符串
+                for cookie_str in self.zhihu_cookie.split(';'):
+                    if '=' in cookie_str:
+                        name, value = cookie_str.strip().split('=', 1)
+                        if name and value:
+                            # 使用CDP设置cookie
+                            try:
+                                await cdp_session.send('Network.setCookie', {
+                                    'name': name,
+                                    'value': value,
+                                    'domain': '.zhihu.com',
+                                    'path': '/',
+                                    'secure': True,
+                                    'httpOnly': False,
+                                    'sameSite': 'None'
+                                })
+                                print(f"通过CDP设置cookie: {name}")
+                            except Exception as e:
+                                print(f"设置cookie {name} 失败: {str(e)}")
+                
+                # 关闭临时页面
+                await cdp_session.detach()
+            
+            # 创建新页面
+            page = await context.new_page()
+            
+            # 注入JS脚本来模拟真实浏览器环境，隐藏自动化特征
+            await page.add_init_script("""
+                // 覆盖navigator.webdriver
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => false,
+                    configurable: true
+                });
+                
+                // 添加Chromium浏览器特有的属性
+                window.chrome = {
+                    runtime: {},
+                    loadTimes: function() {},
+                    csi: function() {},
+                    app: {}
+                };
+                
+                // 覆盖Permissions API
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (parameters) => (
+                    parameters.name === 'notifications' ?
+                    Promise.resolve({state: Notification.permission}) :
+                    originalQuery(parameters)
+                );
+                
+                // 修改WebGL指纹
+                const getParameter = WebGLRenderingContext.prototype.getParameter;
+                WebGLRenderingContext.prototype.getParameter = function(parameter) {
+                    if (parameter === 37445) {
+                        return 'Intel Inc.';
+                    }
+                    if (parameter === 37446) {
+                        return 'Intel Iris Pro Graphics';
+                    }
+                    return getParameter.apply(this, [parameter]);
+                };
+                
+                // 随机化canvas指纹
+                const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+                HTMLCanvasElement.prototype.toDataURL = function(type) {
+                    if (type === 'image/png' && this.width === 16 && this.height === 16) {
+                        // 这很可能是指纹采集
+                        const canvas = document.createElement('canvas');
+                        canvas.width = this.width;
+                        canvas.height = this.height;
+                        const ctx = canvas.getContext('2d');
+                        
+                        // 从原始画布复制内容
+                        ctx.drawImage(this, 0, 0);
+                        
+                        // 添加微小的噪点
+                        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                        const data = imageData.data;
+                        
+                        for (let i = 0; i < data.length; i += 4) {
+                            // 随机调整RGB值，但改动很小
+                            data[i] = data[i] + Math.floor(Math.random() * 10) - 5;     // R
+                            data[i+1] = data[i+1] + Math.floor(Math.random() * 10) - 5; // G
+                            data[i+2] = data[i+2] + Math.floor(Math.random() * 10) - 5; // B
+                        }
+                        
+                        ctx.putImageData(imageData, 0, 0);
+                        return origToDataURL.apply(canvas, arguments);
+                    }
+                    
+                    return origToDataURL.apply(this, arguments);
+                };
+                
+                // 修改AudioContext指纹
+                const audioContext = window.AudioContext || window.webkitAudioContext;
+                if (audioContext) {
+                    const origGetChannelData = AudioBuffer.prototype.getChannelData;
+                    AudioBuffer.prototype.getChannelData = function() {
+                        const channelData = origGetChannelData.apply(this, arguments);
+                        
+                        // 只在可能是指纹采集的情况下修改
+                        if (channelData.length > 20) {
+                            // 添加微小噪点
+                            const noise = 0.0001;
+                            for (let i = 0; i < Math.min(channelData.length, 500); i++) {
+                                channelData[i] = channelData[i] + (Math.random() * noise * 2 - noise);
+                            }
+                        }
+                        
+                        return channelData;
+                    };
+                }
+                
+                // 随机化硬件并发数
+                Object.defineProperty(navigator, 'hardwareConcurrency', {
+                    get: () => 8 + Math.floor(Math.random() * 4),
+                    configurable: true
+                });
+                
+                // 随机化设备内存大小
+                Object.defineProperty(navigator, 'deviceMemory', {
+                    get: () => 8,
+                    configurable: true
+                });
+            """)
+            
+            # 模拟人类行为函数
+            async def simulate_human_behavior():
+                # 随机的鼠标移动
+                for i in range(3):
+                    x = random.randint(100, width - 200)
+                    y = random.randint(100, height - 200)
+                    await page.mouse.move(x, y, steps=25)
+                    await asyncio.sleep(0.5 + random.random() * 0.5)
+                
+                # 随机的短暂停顿
+                await asyncio.sleep(1 + random.random() * 2)
+            
+            # 尝试模拟正常用户的浏览行为
+            print(f"正在直接打开问题页面: {question_url}")
+            
+            # 如果有cookie，先设置cookie
+            if self.zhihu_cookie:
+                # 创建一个空白页用于设置cookie
+                blank_page = await context.new_page()
+                await blank_page.goto("about:blank")
+                
+                # 使用辅助函数设置cookie
+                try:
+                    current_cookies = await self.set_cookie_helper(blank_page, self.zhihu_cookie)
+                    print(f"当前页面cookie: {current_cookies[:30]}...")
+                except Exception as e:
+                    print(f"设置cookie失败: {str(e)}")
+                    current_cookies = ""
+                
+                # 尝试设置localStorage
+                if "z_c0" in self.zhihu_cookie:
+                    z_c0_value = re.search(r'z_c0=([^;]+)', self.zhihu_cookie)
+                    if z_c0_value:
+                        token_value = z_c0_value.group(1)
+                        
+                        # 生成一个随机的SESSIONID如果不存在
+                        has_session_id = "SESSIONID=" in self.zhihu_cookie
+                        session_script = ""
+                        if not has_session_id:
+                            import uuid
+                            session_id = str(uuid.uuid4()).replace("-", "")
+                            session_script = f'document.cookie = "SESSIONID={session_id};domain=.zhihu.com;path=/;secure=true;httpOnly=true";'
+                            print(f"在localStorage设置时添加SESSIONID: {session_id[:8]}...")
+                        
+                        await blank_page.evaluate(f"""() => {{
+                            localStorage.setItem('z_c0', '{token_value}');
+                            localStorage.setItem('LOGIN_STATUS', '1');
+                            
+                            // 额外设置SESSIONID
+                            {session_script}
+                            
+                            // 设置XSRF Token (如果需要)
+                            const xsrfToken = Math.random().toString(36).slice(2);
+                            document.cookie = `_xsrf=${{xsrfToken}};domain=.zhihu.com;path=/`;
+                            localStorage.setItem('_xsrf', xsrfToken);
+                        }}""")
+                        print("已设置localStorage认证信息")
+                
+                # 关闭空白页
+                await blank_page.close()
+            
+            # 直接访问问题页面
+            await page.goto(question_url, wait_until="domcontentloaded")
+            
+            # 随机的等待时间，模拟用户浏览行为
+            await asyncio.sleep(2 + random.random() * 1)
+            
+            # 检查是否成功登录
+            print("检查登录状态...")
+            logged_in = await page.evaluate("""() => {
+                return document.querySelector('.AppHeader-userInfo') !== null || 
+                       document.querySelector('.Avatar') !== null;
+            }""")
+            
+            if logged_in:
+                print("已成功登录知乎")
+            else:
+                print("未登录状态，将尝试继续以游客身份访问")
+                
+                # 尝试关闭登录提示弹窗如果存在
+                try:
+                    if await page.query_selector('.Modal-closeButton'):
+                        await page.click('.Modal-closeButton')
+                        await asyncio.sleep(1)
+                except:
+                    pass
+            
+            # 如果仍未登录，尝试使用localStorage或直接注入cookie
+            if not logged_in and self.zhihu_cookie:
+                print("尝试其他方式设置cookie...")
+                # 方法1：通过localStorage设置token
+                if "z_c0" in self.zhihu_cookie:
+                    z_c0_value = re.search(r'z_c0=([^;]+)', self.zhihu_cookie)
+                    if z_c0_value:
+                        token_value = z_c0_value.group(1)
+                        # 生成一个随机的SESSIONID
+                        import uuid
+                        session_id = str(uuid.uuid4()).replace("-", "")
+                        
+                        await page.evaluate(f"""() => {{
+                            // 设置z_c0
+                            document.cookie = "z_c0={token_value};domain=.zhihu.com;path=/;secure=true;httpOnly=true";
+                            localStorage.setItem('z_c0', '{token_value}');
+                            
+                            // 设置SESSIONID
+                            document.cookie = "SESSIONID={session_id};domain=.zhihu.com;path=/;secure=true;httpOnly=true";
+                            
+                            // 设置XSRF Token
+                            const xsrfToken = Math.random().toString(36).slice(2);
+                            document.cookie = `_xsrf=${{xsrfToken}};domain=.zhihu.com;path=/`;
+                            localStorage.setItem('_xsrf', xsrfToken);
+                            
+                            // 模拟登录状态
+                            localStorage.setItem('LOGIN_STATUS', '1');
+                            
+                            console.log("已设置所有必要的cookie和localStorage");
+                        }}""")
+                        
+                        print(f"已设置SESSIONID: {session_id[:8]}...")
+                
+                # 方法2：重新加载页面强制应用cookie
+                await page.reload()
+                await asyncio.sleep(2)
+                
+                # 方法3：直接尝试使用设置的cookie访问问题页面
+                print("直接尝试访问问题页面...")
+                await page.goto(question_url, wait_until="domcontentloaded")
+                await asyncio.sleep(2)
+                
+                # 再次检查登录状态
+                logged_in = await page.evaluate("""() => {
+                    return document.querySelector('.AppHeader-userInfo') !== null || 
+                           document.querySelector('.Avatar') !== null;
+                }""")
+            
+            # 在问题页面上模拟一些人类行为
+            await simulate_human_behavior()
+            
+            # 等待页面加载并模拟人类行为
+            await asyncio.sleep(2 + random.random() * 2)
+            await simulate_human_behavior()
+            
+            # 检查是否遇到403错误或者其他限制
+            error_status = await page.evaluate("""() => {
+                if (document.body.innerText.includes('403') || 
+                    document.body.innerText.includes('访问受限') || 
+                    document.body.innerText.includes('异常')) {
+                    return true;
+                }
+                return false;
+            }""")
+            
+            if error_status:
+                print("遇到访问限制，等待60秒后重试...")
+                await asyncio.sleep(60)
+                
+                # 模拟人类行为再次尝试
+                await simulate_human_behavior()
+                await page.goto(question_url, wait_until="domcontentloaded")
+                
+                # 再次检查错误
+                error_status = await page.evaluate("""() => {
+                    if (document.body.innerText.includes('403') || 
+                        document.body.innerText.includes('访问受限') || 
+                        document.body.innerText.includes('异常')) {
+                        return true;
+                    }
+                    return false;
+                }""")
+                
+                if error_status:
+                    print("仍然无法访问该页面，建议稍后再试或更换IP地址")
+                    await browser.close()
+                    return None
+            
+            # 提取问题标题和描述
+            print("提取问题数据...")
+            title = await page.evaluate("""() => {
+                const titleElem = document.querySelector('h1.QuestionHeader-title');
+                return titleElem ? titleElem.innerText : '未找到标题';
+            }""")
+            
+            description = await page.evaluate("""() => {
+                const descElem = document.querySelector('.QuestionRichText');
+                return descElem ? descElem.innerText : '未找到描述';
+            }""")
+            
+            # 保存问题信息
+            question_data = {
+                "title": title,
+                "description": description,
+                "url": question_url
+            }
+            
+            print(f"已获取问题: {title}")
+            
+            # 模拟人类行为
+            await simulate_human_behavior()
+            
+            # 开始加载回答前滚动预览一下页面，看起来更像真实用户
+            for i in range(3):
+                scroll_pos = random.randint(300, 1000)
+                await page.evaluate(f"window.scrollTo(0, {scroll_pos})")
+                await asyncio.sleep(1 + random.random())
+            
+            # 开始加载回答
+            print("开始加载回答...")
+            answer_count_text = await page.evaluate("""() => {
+                const countElem = document.querySelector('.List-headerText');
+                return countElem ? countElem.innerText : '0 个回答';
+            }""")
+            
+            print(f"问题有 {answer_count_text}")
+            
+            # 提取回答数据
+            answers = []
+            answer_count = 0
+            
+            # 尝试获取当前可见的回答
+            async def extract_visible_answers():
+                return await page.evaluate("""() => {
+                    const answerItems = document.querySelectorAll('.List-item');
+                    const results = [];
+                    
+                    for (const item of answerItems) {
+                        try {
+                            const authorElem = item.querySelector('.AuthorInfo-name');
+                            const contentElem = item.querySelector('.RichText');
+                            const votesElem = item.querySelector('.VoteButton--up');
+                            const commentsElem = item.querySelector('.Button--plain');
+                            const timeElem = item.querySelector('.ContentItem-time');
+                            
+                            if (!authorElem || !contentElem) continue;
+                            
+                            const author = authorElem.innerText || '匿名用户';
+                            const content = contentElem.innerText || '';
+                            const contentHtml = contentElem.innerHTML || '';
+                            const votes = votesElem ? votesElem.innerText.replace('赞同', '').trim() : '0';
+                            const comments = commentsElem ? commentsElem.innerText.replace('评论', '').trim() : '0';
+                            let time = timeElem ? timeElem.innerText : '';
+                            
+                            // 提取创建时间
+                            if (time.includes('编辑于')) {
+                                time = time.split('编辑于')[1].trim();
+                            } else if (time.includes('发布于')) {
+                                time = time.split('发布于')[1].trim();
+                            }
+                            
+                            results.push({
+                                author,
+                                content,
+                                contentHtml,
+                                votes,
+                                comments,
+                                time
+                            });
+                        } catch (e) {
+                            console.error('提取回答时出错:', e);
+                        }
+                    }
+                    
+                    return results;
+                }""")
+            
+            # 滚动加载更多回答
+            while True:
+                # 提取当前可见的回答
+                new_answers = await extract_visible_answers()
+                
+                # 防止重复添加
+                new_count = 0
+                for answer in new_answers:
+                    if answer not in answers:
+                        answers.append(answer)
+                        new_count += 1
+                
+                current_count = len(answers)
+                print(f"当前已加载 {current_count} 个回答")
+                
+                if new_count == 0:
+                    print("未发现新回答，尝试滚动加载更多")
+                
+                # 模拟真实的浏览行为：随机滚动距离，而不是直接到底部
+                current_scroll_y = int(await page.evaluate("window.scrollY"))
+                document_height = int(await page.evaluate("document.body.scrollHeight"))
+                
+                # 确保下限和上限有效（下限 < 上限）
+                scroll_min = current_scroll_y + 500
+                scroll_max = int(document_height * 0.8)
+                
+                # 防止空范围错误
+                if scroll_min >= scroll_max:
+                    scroll_min = current_scroll_y
+                    scroll_max = max(current_scroll_y + 500, document_height - 200)
+                
+                scroll_pos = random.randint(scroll_min, scroll_max)
+                
+                await page.evaluate(f"window.scrollTo(0, {scroll_pos})")
+                
+                # 随机等待时间
+                await asyncio.sleep(2 + random.random() * 3)
+                
+                # 模拟阅读内容的行为
+                if random.random() > 0.7:
+                    await simulate_human_behavior()
+                
+                # 检查是否已经滚动到底部
+                is_bottom = await page.evaluate("""() => {
+                    return window.innerHeight + window.scrollY >= document.body.scrollHeight - 200;
+                }""")
+                
+                # 检查是否还有更多回答按钮
+                has_more_button = await page.evaluate("""() => {
+                    const button = document.querySelector('.QuestionMainAction');
+                    return button && (button.innerText.includes('更多回答') || button.innerText.includes('查看全部'));
+                }""")
+                
+                if has_more_button:
+                    # 点击加载更多回答，添加人类行为随机性
+                    print("点击加载更多回答按钮")
+                    
+                    # 先模拟鼠标移动到按钮上
+                    button = await page.query_selector('.QuestionMainAction')
+                    if button:
+                        button_box = await button.bounding_box()
+                        if button_box:
+                            # 移动到按钮中心点
+                            await page.mouse.move(
+                                button_box['x'] + button_box['width'] / 2 + random.randint(-10, 10), 
+                                button_box['y'] + button_box['height'] / 2 + random.randint(-5, 5)
+                            )
+                            await asyncio.sleep(0.5 + random.random() * 0.5)
+                    
+                    # 点击按钮
+                    await page.click('.QuestionMainAction')
+                    await asyncio.sleep(2 + random.random() * 2)  # 随机等待时间
+                    continue
+                
+                if is_bottom and new_count == 0:
+                    print("已到达页面底部，没有更多回答可加载")
+                    # 最后再尝试提取一次，确保获取最新加载的内容
+                    final_answers = await extract_visible_answers()
+                    for answer in final_answers:
+                        if answer not in answers:
+                            answers.append(answer)
+                    break
+                
+                # 设置一个最大回答数的阈值，避免无限循环
+                if len(answers) >= 100:
+                    print("已达到最大抓取回答数量限制")
+                    break
+            
+            print(f"共获取到 {len(answers)} 个回答")
+            
+            # 将回答按点赞数排序
+            def parse_votes(votes_str):
+                if not votes_str or votes_str == '0':
+                    return 0
+                
+                if 'K' in votes_str:
+                    return int(float(votes_str.replace('K', '')) * 1000)
+                
+                try:
+                    return int(votes_str)
+                except:
+                    return 0
+            
+            answers.sort(key=lambda x: parse_votes(x['votes']), reverse=True)
+            
+            # 构建Markdown内容
+            question_md = f"# {title}\n\n"
+            question_md += f"问题链接: {question_url}\n\n"
+            if description:
+                question_md += f"## 问题描述\n\n{description}\n\n"
+            
+            question_md += "## 回答列表\n\n"
+            
+            # 保存问题信息
+            with open(os.path.join(question_dir, f"问题详情.md"), 'w', encoding='utf-8') as f:
+                f.write(question_md)
+            
+            # 去除重复回答
+            unique_answers = []
+            content_set = set()
+            
+            for answer in answers:
+                # 使用内容的前100个字符作为去重标识
+                content_start = answer['content'][:100] if answer['content'] else ""
+                if content_start not in content_set:
+                    content_set.add(content_start)
+                    unique_answers.append(answer)
+            
+            print(f"去除重复后，共有 {len(unique_answers)} 个回答")
+            
+            # 每10个回答合并为一个文件
+            batch_size = 10
+            for i in range(0, len(unique_answers), batch_size):
+                batch_answers = unique_answers[i:i+batch_size]
+                batch_num = i // batch_size + 1
+                
+                # 创建合并文件内容
+                batch_md = f"# 第{batch_num}批回答 (共{len(batch_answers)}个)\n\n"
+                
+                for j, answer in enumerate(batch_answers, 1):
+                    # 在当前批次中的序号
+                    batch_index = j
+                    # 在所有回答中的序号
+                    global_index = i + j
+                    
+                    batch_md += f"## 回答 {global_index}: {answer['author']}\n\n"
+                    batch_md += f"点赞数: {answer['votes']} | 评论数: {answer['comments']} | 创建时间: {answer['time']}\n\n"
+                    batch_md += f"### 回答内容\n\n{answer['content']}\n\n"
+                    batch_md += "---\n\n"  # 添加分隔线
+                
+                # 保存合并后的回答文件
+                file_name = f"回答集合_{batch_num:02d}.md"
+                with open(os.path.join(question_dir, file_name), 'w', encoding='utf-8') as f:
+                    f.write(batch_md)
+            
+            print(f"所有回答已合并保存到 {question_dir} 目录，共 {len(unique_answers)//batch_size + (1 if len(unique_answers)%batch_size > 0 else 0)} 个文件")
+            
+            # 关闭浏览器
+            await browser.close()
+            
+            return len(answers)
+    
+    async def scrape_question(self, question_id, output_dir='output', manual_mode=False):
+        """抓取知乎问题的回答"""
+        # 根据模式选择方法
+        if manual_mode:
+            print("使用手动浏览器模式爬取数据（更可靠但较慢）...")
+            result = await self._launch_browser_manually(question_id, output_dir)
+            if result is not None:
+                return result
+            
+            print("手动浏览器方法失败，尝试使用AI代理方法...")
+        
+        # 使用AI代理方法
+        print("使用AI代理模式爬取数据...")
+        
+        # 确保输出目录存在
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+            
+        # 为当前问题创建专属文件夹
+        question_dir = os.path.join(output_dir, str(question_id))
+        if not os.path.exists(question_dir):
+            os.makedirs(question_dir)
+        
+        # 构建知乎问题URL
+        url = f"https://www.zhihu.com/question/{question_id}"
+        
+        # 设置任务描述 - 增强指导性内容以实现更好的隐蔽性
+        task = f"""
+        请访问知乎问题链接 {url} 并执行以下任务：
+        1. 获取问题标题和描述
+        2. 获取所有回答（需要向下滚动加载全部回答）
+        3. 对于每个回答，提取：
+           - 作者名称
+           - 点赞数和评论数
+           - 回答内容（完整的文字和图片链接）
+           - 回答创建时间
+        4. 将所有信息保存为Markdown格式，存储在 {question_dir} 目录下
+        5. 对回答按照点赞数排序
+        
+        注意：
+        - 知乎页面可能需要登录，如果遇到登录提示，请尝试关闭登录弹窗继续浏览
+        - 请依赖页面上的文本描述和标签进行操作
+        - 如果遇到403错误或访问被限制，请等待1-2分钟后重试
+        - 必须实现真实的人类浏览行为以避免被检测，请通过以下方式隐藏自己：
+        
+        【隐蔽操作详细指南】:
+        1. 首次访问行为:
+           - 直接访问问题页面
+           - 模拟几次随机鼠标移动和短暂停顿
+        
+        2. 浏览行为模拟:
+           - 使用类似人类的滚动模式，切勿直接滚到底部
+           - 每次滚动距离约300-700像素，而非整页
+           - 滚动后停留5-15秒，模拟阅读内容
+           - 偶尔进行短距离上下滚动，表现出对内容的关注
+        
+        3. 交互行为:
+           - 点击任何按钮前，先将鼠标移动到按钮位置停留0.5-1秒
+           - 移动鼠标时使用自然曲线而非直线路径（注意：在macOS上需特别注意鼠标移动的自然性）
+           - 点击后等待不同的时间(3-7秒)再执行下一操作
+           - 偶尔在无关紧要区域进行随机点击
+        
+        4. 节奏控制:
+           - 保持不规则的操作节奏，避免机械性定时操作
+           - 加载更多内容前先停顿模拟阅读
+           - 整个浏览过程中偶尔停顿10-20秒不进行任何交互
+
+        5. 页面处理:
+           - 如果出现登录提示，等待2-3秒再尝试关闭弹窗
+           - 遇到验证码挑战时，暂停并详细描述看到的内容
+           - 如果页面加载太慢，等待8-12秒再重试
+           
+        6. 特殊反检测技术:
+           - 在页面加载完成后，执行以下JavaScript代码修改浏览器指纹:
+             ```js
+             // 覆盖navigator.webdriver
+             Object.defineProperty(navigator, 'webdriver', {
+                 get: () => false
+             });
+             
+             // 添加浏览器特有属性
+             window.chrome = {
+                 runtime: {},
+                 loadTimes: function() {},
+                 csi: function() {},
+                 app: {}
+             };
+             
+             // 随机化canvas指纹
+             const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+             HTMLCanvasElement.prototype.toDataURL = function(type) {
+                 if (type === 'image/png' && this.width === 16 && this.height === 16) {
+                     const canvas = document.createElement('canvas');
+                     canvas.width = this.width;
+                     canvas.height = this.height;
+                     const ctx = canvas.getContext('2d');
+                     ctx.drawImage(this, 0, 0);
+                     const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                     const data = imageData.data;
+                     for (let i = 0; i < data.length; i += 4) {
+                         data[i] = data[i] + Math.floor(Math.random() * 10) - 5;
+                         data[i+1] = data[i+1] + Math.floor(Math.random() * 10) - 5;
+                         data[i+2] = data[i+2] + Math.floor(Math.random() * 10) - 5;
+                     }
+                     ctx.putImageData(imageData, 0, 0);
+                     return origToDataURL.apply(canvas, arguments);
+                 }
+                 return origToDataURL.apply(this, arguments);
+             };
+             ```
+           - 对于macOS系统，避免直线鼠标移动，使用多个中间点创建更自然的曲线路径
+           - 设置随机的hardware concurrency和device memory值
+        """
+        
+        # 如果有cookie，添加登录操作指导
+        if self.zhihu_cookie:
+            task += f"""
+            您可以使用以下cookie进行登录以获取更完整的内容。请仔细按步骤操作：
+            
+            步骤：
+            1. 首先打开一个新标签页，并导航到 https://zhihu.com
+            2. 等待页面完全加载，然后仔细观察是否有登录窗口
+            3. 如果网页显示为登录页面，使用开发者工具(按F12或右键检查)打开控制台(Console)
+            4. 在控制台中执行以下操作:
+               
+               // 设置cookie
+               document.cookie = "{self.zhihu_cookie}";
+               
+               // 等待3-5秒后运行下面的脚本设置localStorage和必要的认证信息
+               localStorage.setItem('LOGIN_STATUS', '1');
+               
+               // 如果cookie中包含z_c0，提取并设置到localStorage
+               const z_c0Match = "{self.zhihu_cookie}".match(/z_c0=([^;]+)/);
+               if (z_c0Match) {{
+                   localStorage.setItem('z_c0', z_c0Match[1]);
+               }}
+               
+               // 设置XSRF Token
+               const xsrfToken = Math.random().toString(36).slice(2);
+               document.cookie = `_xsrf=${{xsrfToken}};domain=.zhihu.com;path=/`;
+               localStorage.setItem('_xsrf', xsrfToken);
+               
+               console.log("已完成登录设置");
+               
+            5. 等待3-5秒钟，不要立即刷新
+            6. 然后刷新页面，检查是否成功登录（页面顶部应显示个人头像）
+            7. 如果登录成功，再访问问题页面: {url}
+            8. 如果遇到任何验证码或安全提示，请描述您看到的内容
+            
+            如果以上方法不起作用，可以尝试：
+            1. 导航到问题页面 {url}
+            2. 点击页面上的任何"登录"按钮
+            3. 在登录弹窗中点击"关闭"或"稍后再说"等选项
+            4. 继续以游客身份浏览内容
+            """
+        
+        try:
+            # 先确保所有Chromium实例已关闭
+            if platform.system() == "Darwin":  # macOS
+                try:
+                    os.system("pkill -f 'Chromium'")
+                    time.sleep(2)  # 等待进程完全关闭
+                except:
+                    pass
+            elif platform.system() == "Windows":
+                try:
+                    os.system("taskkill /f /im chromium.exe")
+                    time.sleep(2)
+                except:
+                    pass
+            elif platform.system() == "Linux":
+                try:
+                    os.system("pkill -f chromium")
+                    time.sleep(2)
+                except:
+                    pass
+            
+            # 用户数据目录 - 使用固定目录以保持会话
+            user_data_dir = os.path.expanduser("~/zhihu-browser-profile")
+            os.makedirs(user_data_dir, exist_ok=True)
+            print(f"使用持久化配置目录: {user_data_dir}")
+            
+            # 如果有cookie，准备将cookie保存到本地文件
+            if self.zhihu_cookie:
+                cookie_file = os.path.join(user_data_dir, "cookies.json")
+                try:
+                    # 解析cookie为json格式
+                    cookie_data = []
+                    for cookie_str in self.zhihu_cookie.split(';'):
+                        if '=' in cookie_str:
+                            name, value = cookie_str.strip().split('=', 1)
+                            if name and value:
+                                cookie_data.append({
+                                    "name": name,
+                                    "value": value,
+                                    "domain": ".zhihu.com", 
+                                    "path": "/",
+                                    "secure": True,
+                                    "httpOnly": name in ["z_c0", "SESSIONID"]
+                                })
+                    
+                    # 保存cookie到文件
+                    with open(cookie_file, 'w') as f:
+                        json.dump(cookie_data, f)
+                    print(f"已保存cookie到: {cookie_file}")
+                except Exception as e:
+                    print(f"保存cookie失败: {str(e)}")
+            
+            # 始终使用Chromium浏览器
+            print("使用Chromium浏览器配置")
+            
+            # 添加自定义js代码以注入反检测脚本
+            init_js_code = """
+            // 覆盖navigator.webdriver
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => false,
+                configurable: true
+            });
+            
+            // 添加Chromium浏览器特有的属性
+            window.chrome = {
+                runtime: {},
+                loadTimes: function() {},
+                csi: function() {},
+                app: {}
+            };
+            
+            // 覆盖Permissions API
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications' ?
+                Promise.resolve({state: Notification.permission}) :
+                originalQuery(parameters)
+            );
+            
+            // 修改WebGL指纹
+            const getParameter = WebGLRenderingContext.prototype.getParameter;
+            WebGLRenderingContext.prototype.getParameter = function(parameter) {
+                if (parameter === 37445) {
+                    return 'Intel Inc.';
+                }
+                if (parameter === 37446) {
+                    return 'Intel Iris Pro Graphics';
+                }
+                return getParameter.apply(this, [parameter]);
+            };
+            
+            // 随机化canvas指纹
+            const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+            HTMLCanvasElement.prototype.toDataURL = function(type) {
+                if (type === 'image/png' && this.width === 16 && this.height === 16) {
+                    // 这很可能是指纹采集
+                    const canvas = document.createElement('canvas');
+                    canvas.width = this.width;
+                    canvas.height = this.height;
+                    const ctx = canvas.getContext('2d');
+                    
+                    // 从原始画布复制内容
+                    ctx.drawImage(this, 0, 0);
+                    
+                    // 添加微小的噪点
+                    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                    const data = imageData.data;
+                    
+                    for (let i = 0; i < data.length; i += 4) {
+                        // 随机调整RGB值，但改动很小
+                        data[i] = data[i] + Math.floor(Math.random() * 10) - 5;     // R
+                        data[i+1] = data[i+1] + Math.floor(Math.random() * 10) - 5; // G
+                        data[i+2] = data[i+2] + Math.floor(Math.random() * 10) - 5; // B
+                    }
+                    
+                    ctx.putImageData(imageData, 0, 0);
+                    return origToDataURL.apply(canvas, arguments);
+                }
+                
+                return origToDataURL.apply(this, arguments);
+            };
+            
+            // 修改AudioContext指纹
+            const audioContext = window.AudioContext || window.webkitAudioContext;
+            if (audioContext) {
+                const origGetChannelData = AudioBuffer.prototype.getChannelData;
+                AudioBuffer.prototype.getChannelData = function() {
+                    const channelData = origGetChannelData.apply(this, arguments);
+                    
+                    // 只在可能是指纹采集的情况下修改
+                    if (channelData.length > 20) {
+                        // 添加微小噪点
+                        const noise = 0.0001;
+                        for (let i = 0; i < Math.min(channelData.length, 500); i++) {
+                            channelData[i] = channelData[i] + (Math.random() * noise * 2 - noise);
+                        }
+                    }
+                    
+                    return channelData;
+                };
+            }
+            
+            // 随机化硬件并发数
+            Object.defineProperty(navigator, 'hardwareConcurrency', {
+                get: () => 8 + Math.floor(Math.random() * 4),
+                configurable: true
+            });
+            
+            // 随机化设备内存大小
+            Object.defineProperty(navigator, 'deviceMemory', {
+                get: () => 8,
+                configurable: true
+            });
+            """
+            
+            # 随机化窗口大小
+            width = 1920 + random.randint(-100, 100)
+            height = 1080 + random.randint(-50, 50)
+                
+            # 创建增强的浏览器配置
+            browser_config = BrowserConfig(
+                headless=False,
+                persistent_context_dir=user_data_dir,  # 使用持久化配置目录
+                viewport_width=width,
+                viewport_height=height,
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chromium/136.0.0.0 Safari/537.36",
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
+                extra_browser_args=[
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                    "--disable-site-isolation-trials",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    f"--window-size={width},{height}"
+                ],
+                extra_http_headers={
+                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                    "accept-encoding": "gzip, deflate, br, zstd",
+                    "accept-language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7,zh-CN;q=0.6",
+                    "cache-control": "no-cache",
+                    "pragma": "no-cache",
+                    "sec-ch-ua": '"Chromium";v="136", "Not.A/Brand";v="99"',
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": '"macOS"',
+                    "sec-fetch-dest": "document",
+                    "sec-fetch-mode": "navigate",
+                    "sec-fetch-site": "none",
+                    "sec-fetch-user": "?1",
+                    "upgrade-insecure-requests": "1"
+                },
+                init_js=init_js_code  # 添加自定义JS脚本注入
+            )
+            print(f"启动Chromium，用户数据目录: {user_data_dir}")
+            
+            # 创建浏览器实例
+            browser = Browser(config=browser_config)
+            
+            # 创建agent配置参数
+            agent = Agent(
+                task=task,
+                llm=self.llm,
+                browser=browser
+            )
+            
+            # 运行agent
+            try:
+                result = await agent.run()
+                # 关闭浏览器
+                await browser.close()
+                return result
+            except Exception as e:
+                print(f"AI代理运行失败: {str(e)}")
+                # 如果出错，确保关闭浏览器
+                try:
+                    await browser.close()
+                except:
+                    pass
+                raise e
+                
+        except Exception as e:
+            # 如果使用增强配置失败，尝试使用最基本的配置或回退到手动模式
+            print(f"AI代理模式初始化失败 (原因: {str(e)})")
+            
+            # 尝试使用手动模式作为备选方案
+            print("由于AI代理模式失败，自动切换到手动浏览器模式...")
+            return await self._launch_browser_manually(question_id, output_dir)
+
+    async def set_cookie_helper(self, page, cookie_string):
+        """辅助函数：在页面中设置cookie
+        Args:
+            page: playwright页面对象
+            cookie_string: cookie字符串
+        """
+        # 首先导航到知乎域名
+        await page.goto("https://www.zhihu.com", wait_until="domcontentloaded")
+        await asyncio.sleep(1)
+        
+        # 处理cookie字符串中可能存在的转义字符
+        cookie_string = cookie_string.replace("'", "\\'").replace('"', '\\"')
+        
+        # 检查是否包含SESSIONID，如果没有则生成一个
+        has_session_id = "SESSIONID=" in cookie_string
+        session_id = ""
+        if not has_session_id:
+            import uuid
+            session_id = str(uuid.uuid4()).replace("-", "")
+            print(f"生成新的SESSIONID: {session_id[:8]}...")
+        
+        # 使用JavaScript在浏览器中设置cookie
+        script = f"""
+        (cookieStr => {{
+            const cookies = '{cookie_string}'.split(';');
+            for (const cookie of cookies) {{
+                if (cookie.trim()) {{
+                    document.cookie = cookie.trim() + ';domain=.zhihu.com;path=/;secure=true;';
+                }}
+            }}
+            
+            // 添加SESSIONID如果不存在
+            {f'document.cookie = "SESSIONID={session_id};domain=.zhihu.com;path=/;secure=true;httpOnly=true";' if not has_session_id else ''}
+            
+            return document.cookie;
+        }})()
+        """
+        return await page.evaluate(script)
+
+def main():
+    """主函数：解析命令行参数并启动爬虫"""
+    parser = argparse.ArgumentParser(description='知乎问题爬虫 - 支持AI代理和手动浏览器两种模式')
+    parser.add_argument('question_id', type=str, help='知乎问题ID（例如：https://www.zhihu.com/question/12345中的12345）')
+    parser.add_argument('--output', type=str, default='output', help='输出目录，默认为output')
+    parser.add_argument('--api-key', type=str, help='API密钥（用于AI代理模式，如不提供将尝试从环境变量加载）')
+    parser.add_argument('--model', type=str, default='auto', help='AI模型名称，默认为auto（自动选择，会根据可用的API密钥选择模型）')
+    parser.add_argument('--cookie', type=str, help='知乎Cookie（可选，用于获取登录后才能看到的内容）')
+    parser.add_argument('--manual', action='store_true', help='使用手动浏览器模式（更可靠但较慢）')
+    
+    args = parser.parse_args()
+    
+    # 初始化爬虫
+    scraper = ZhihuBrowserScraper(
+        api_key=args.api_key,
+        model_name=args.model,
+        zhihu_cookie=args.cookie
+    )
+    
+    # 运行爬虫
+    asyncio.run(scraper.scrape_question(args.question_id, args.output, args.manual))
+
+if __name__ == "__main__":
+    main() 
