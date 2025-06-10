@@ -15,6 +15,7 @@
   - 自动适配可用的API密钥
 - **登录支持**
   - 通过Cookie实现登录，获取完整内容（包括登录后才能查看的内容）
+  - 内置登录命令，方便保存登录状态
   - 智能Cookie处理，自动生成必要参数
 - **高级反检测**
   - 内置多种浏览器指纹伪装技术
@@ -73,14 +74,20 @@ playwright install
 ```ini
 # API密钥（选择一个配置）
 OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-# DEEPSEEK_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-# ANTHROPIC_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-# GOOGLE_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
-# 知乎Cookie（可选，但推荐提供以获取更完整内容）
-ZHIHU_COOKIE_FULL=z_c0=xxxxxxx; _xsrf=xxxxxxx; SESSIONID=xxxxxxx
-# 或者仅提供z_c0(身份认证核心)
-# ZHIHU_COOKIE_Z_C0=xxxxxxx
+# Anthropic Claude模型
+# ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxx
+
+# Azure OpenAI服务
+# AZURE_OPENAI_ENDPOINT=https://xxxx.openai.azure.com
+# AZURE_OPENAI_KEY=xxxxxxxxxxxxxxxx
+
+# Gemini模型
+# GOOGLE_API_KEY=xxxxxxxxxxxxxxxx
+
+# DeepSeek模型
+# DEEPSEEK_API_KEY=xxxxxxxxxxxxxxxx
+
 
 # 禁用telemetry（可选）
 ANONYMIZED_TELEMETRY=false
@@ -90,24 +97,46 @@ ANONYMIZED_TELEMETRY=false
 
 ### 命令行使用
 
+现在，zhihu-scraper 工具支持多种子命令：
+
 ```bash
-# 基本用法（使用AI代理模式）
-zhihu-scraper 537377466
+# 登录知乎（保存登录状态）
+zhihu-scraper login
+
+# 设置登录超时时间（单位：秒）
+zhihu-scraper login --timeout 600
+
+# 指定浏览器数据存储目录
+zhihu-scraper login --user-data-dir ~/my-zhihu-profile
+```
+
+```bash
+# 爬取问题（AI代理模式,需要提前登录）
+zhihu-scraper scrape 537377466
 
 # 使用手动浏览器模式（更可靠但较慢）
-zhihu-scraper 537377466 --manual
+zhihu-scraper scrape 537377466 --manual
 
 # 指定API密钥和模型
-zhihu-scraper 537377466 --api-key sk-xxx --model gpt-4o
+zhihu-scraper scrape 537377466 --api-key sk-xxx --model gpt-4o
 
 # 使用DeepSeek模型
-zhihu-scraper 537377466 --model deepseek-chat --api-key sk-xxx
+zhihu-scraper scrape 537377466 --model deepseek-chat --api-key sk-xxx
 
 # 指定输出目录
-zhihu-scraper 537377466 --output ./my_data
+zhihu-scraper scrape 537377466 --output ./my_data
 
 # 使用Cookie进行登录
-zhihu-scraper 537377466 --cookie "z_c0=xxx; _xsrf=xxx"
+zhihu-scraper scrape 537377466 --cookie "z_c0=xxx; _xsrf=xxx"
+
+# 使用之前保存的登录状态（指定相同的user-data-dir）
+zhihu-scraper scrape 537377466 --user-data-dir ~/my-zhihu-profile
+```
+
+```bash
+# 兼容旧版本的命令格式（无需子命令）
+zhihu-scraper 537377466
+zhihu-scraper 537377466 --manual
 ```
 
 ### 代码中使用
@@ -164,7 +193,7 @@ output/537377466/
 ### 3. 无法获取登录后内容
 
 问题: 只能获取未登录可见的内容。
-解决: 提供有效的知乎Cookie，至少包含`z_c0`参数。
+解决: 使用 `zhihu-scraper login` 命令进行手动登录，保存登录状态后再运行爬虫命令。
 
 ### 4. 浏览器启动失败
 

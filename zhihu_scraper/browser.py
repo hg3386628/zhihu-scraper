@@ -7,6 +7,7 @@ import re
 import random
 import asyncio
 import json
+import time
 from playwright.async_api import async_playwright
 
 async def _launch_browser_manually(self, question_id, output_dir='output'):
@@ -93,32 +94,78 @@ async def _launch_browser_manually(self, question_id, output_dir='output'):
     print(f"添加cookie数量: {len(cookies)}")
     
     # 随机化窗口大小以增加真实感
-    width = 1920 + random.randint(-100, 100)
-    height = 1080 + random.randint(-50, 50)
+    width = 1920 + random.randint(-150, 150)
+    height = 1080 + random.randint(-80, 80)
     
-    # 增强的浏览器启动参数，更全面的反自动化检测
-    browser_args = [
-        '--disable-blink-features=AutomationControlled',
-        '--disable-features=IsolateOrigins,site-per-process',
-        '--disable-site-isolation-trials',
-        f'--window-size={width},{height}',
-        '--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chromium/136.0.0.0 Safari/537.36'
+    # 随机化语言和UA，避免固定特征
+    languages = ["zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7", 
+                "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7,zh-CN;q=0.6", 
+                "zh-CN,zh;q=0.9,en;q=0.8,zh-TW;q=0.7,en-US;q=0.6"]
+    
+    user_agents = [
+        f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{110+random.randint(0,8)}.0.0.0 Safari/537.36",
+        f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{110+random.randint(0,8)}.0.0.0 Safari/537.36",
+        f"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.{random.randint(0,5)} Safari/605.1.15"
     ]
     
-    # 注入的反检测JS代码
+    selected_ua = random.choice(user_agents)
+    selected_lang = random.choice(languages)
+    
+    # 增强的浏览器启动参数，移除明显的自动化特征
+    browser_args = [
+        # 禁用自动化检测
+        '--disable-blink-features=AutomationControlled',
+        # 禁用站点隔离（可能会暴露自动化特征）
+        '--disable-features=IsolateOrigins',
+        # 窗口大小
+        f'--window-size={width},{height}',
+        # 禁用默认浏览器检查
+        '--no-default-browser-check',
+        # 禁用首次运行体验
+        '--no-first-run',
+        # 随机化字体渲染
+        f'--font-render-hinting={random.choice(["none", "medium", "full"])}',
+        # 禁用用户代理客户端提示
+        '--disable-features=UserAgentClientHint',
+        # 添加一些随机参数增加随机性
+        f'--renderer-process-limit={4+random.randint(1,4)}'
+    ]
+    
+    # 增强版的反检测JS代码，对抗知乎的自动化检测
     anti_detection_js = """
     // 覆盖navigator.webdriver
     Object.defineProperty(navigator, 'webdriver', {
-        get: () => false,
+        get: () => undefined,
         configurable: true
     });
     
-    // 添加Chromium浏览器特有的属性
+    // 添加更完整的Chromium浏览器特有属性
     window.chrome = {
-        runtime: {},
-        loadTimes: function() {},
-        csi: function() {},
-        app: {}
+        runtime: {
+            connect: function() {},
+            sendMessage: function() {},
+            onMessage: {
+                addListener: function() {},
+                removeListener: function() {}
+            }
+        },
+        loadTimes: function() { 
+            return {
+                firstPaintTime: Date.now() - Math.floor(Math.random() * 2000),
+                requestTime: Date.now() - Math.floor(Math.random() * 3000)
+            }; 
+        },
+        csi: function() { 
+            return {
+                startE: Date.now() - Math.floor(Math.random() * 1000),
+                onloadT: Date.now() - Math.floor(Math.random() * 3000)
+            }; 
+        },
+        app: {
+            isInstalled: false,
+            getDetails: function() {},
+            getIsInstalled: function() { return false; }
+        }
     };
     
     // 覆盖Permissions API
@@ -126,11 +173,15 @@ async def _launch_browser_manually(self, question_id, output_dir='output'):
     window.navigator.permissions.query = (parameters) => (
         parameters.name === 'notifications' ?
         Promise.resolve({state: Notification.permission}) :
+        parameters.name === 'clipboard-read' ?
+        Promise.resolve({state: 'prompt'}) :
+        parameters.name === 'clipboard-write' ?
+        Promise.resolve({state: 'granted'}) :
         originalQuery(parameters)
     );
     
-    // 修改WebGL指纹
-    const getParameter = WebGLRenderingContext.prototype.getParameter;
+    // 增强版WebGL指纹随机化
+    const getParameterBackup = WebGLRenderingContext.prototype.getParameter;
     WebGLRenderingContext.prototype.getParameter = function(parameter) {
         if (parameter === 37445) {
             return 'Intel Inc.';
@@ -138,10 +189,16 @@ async def _launch_browser_manually(self, question_id, output_dir='output'):
         if (parameter === 37446) {
             return 'Intel Iris Pro Graphics';
         }
-        return getParameter.apply(this, [parameter]);
+        if (parameter === 35661) {
+            return Math.floor(Math.random() * 10) + 20; // 随机化 MAX_VERTEX_TEXTURE_IMAGE_UNITS
+        }
+        if (parameter === 34076) {
+            return Math.floor(Math.random() * 5) + 10; // 随机化 MAX_COMBINED_TEXTURE_IMAGE_UNITS
+        }
+        return getParameterBackup.apply(this, [parameter]);
     };
     
-    // 随机化canvas指纹
+    // 增强版canvas指纹随机化
     const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
     HTMLCanvasElement.prototype.toDataURL = function(type) {
         if (type === 'image/png' && this.width === 16 && this.height === 16) {
@@ -160,9 +217,9 @@ async def _launch_browser_manually(self, question_id, output_dir='output'):
             
             for (let i = 0; i < data.length; i += 4) {
                 // 随机调整RGB值，但改动很小
-                data[i] = data[i] + Math.floor(Math.random() * 10) - 5;     // R
-                data[i+1] = data[i+1] + Math.floor(Math.random() * 10) - 5; // G
-                data[i+2] = data[i+2] + Math.floor(Math.random() * 10) - 5; // B
+                data[i] = data[i] + Math.floor(Math.random() * 6) - 3;     // R
+                data[i+1] = data[i+1] + Math.floor(Math.random() * 6) - 3; // G
+                data[i+2] = data[i+2] + Math.floor(Math.random() * 6) - 3; // B
             }
             
             ctx.putImageData(imageData, 0, 0);
@@ -172,7 +229,7 @@ async def _launch_browser_manually(self, question_id, output_dir='output'):
         return origToDataURL.apply(this, arguments);
     };
     
-    // 修改AudioContext指纹
+    // 增强版AudioContext指纹随机化
     const audioContext = window.AudioContext || window.webkitAudioContext;
     if (audioContext) {
         const origGetChannelData = AudioBuffer.prototype.getChannelData;
@@ -183,8 +240,9 @@ async def _launch_browser_manually(self, question_id, output_dir='output'):
             if (channelData.length > 20) {
                 // 添加微小噪点
                 const noise = 0.0001;
+                const originalData = new Float32Array(channelData);
                 for (let i = 0; i < Math.min(channelData.length, 500); i++) {
-                    channelData[i] = channelData[i] + (Math.random() * noise * 2 - noise);
+                    channelData[i] = originalData[i] + (Math.random() * noise * 2 - noise);
                 }
             }
             
@@ -194,154 +252,244 @@ async def _launch_browser_manually(self, question_id, output_dir='output'):
     
     // 随机化硬件并发数
     Object.defineProperty(navigator, 'hardwareConcurrency', {
-        get: () => 8 + Math.floor(Math.random() * 4),
+        get: () => Math.min(8 + Math.floor(Math.random() * 4), 16),
         configurable: true
     });
     
     // 随机化设备内存大小
     Object.defineProperty(navigator, 'deviceMemory', {
-        get: () => 8,
+        get: () => Math.min(8 + Math.floor(Math.random() * 8), 16),
         configurable: true
     });
+    
+    // 模拟电池API以增加真实性
+    if (navigator.getBattery) {
+        navigator.getBattery = function() {
+            return Promise.resolve({
+                charging: Math.random() > 0.3,
+                chargingTime: Math.floor(Math.random() * 3000),
+                dischargingTime: Math.floor(Math.random() * 10000),
+                level: Math.random() * 0.7 + 0.3,
+                onchargingchange: null,
+                onchargingtimechange: null,
+                ondischargingtimechange: null,
+                onlevelchange: null
+            });
+        };
+    }
+    
+    // 随机化外接设备
+    if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+        const originalEnumerateDevices = navigator.mediaDevices.enumerateDevices;
+        navigator.mediaDevices.enumerateDevices = function() {
+            return originalEnumerateDevices.apply(this, arguments)
+                .then(devices => {
+                    if (devices.length > 0) {
+                        return devices;
+                    } else {
+                        // 如果没有设备，模拟一些常见设备
+                        return [
+                            { deviceId: 'default', kind: 'audioinput', label: 'Default Audio Device', groupId: 'default' },
+                            { deviceId: 'default', kind: 'audiooutput', label: 'Default Audio Device', groupId: 'default' }
+                        ];
+                    }
+                });
+        };
+    }
+    
+    // 植入一些随机历史记录以模拟正常用户
+    if (window.history && window.history.length < 3) {
+        Object.defineProperty(window.history, 'length', {
+            get: () => 2 + Math.floor(Math.random() * 5)
+        });
+    }
+    
+    // 混淆屏幕/窗口大小
+    Object.defineProperty(screen, 'availWidth', { get: () => window.innerWidth });
+    Object.defineProperty(screen, 'availHeight', { get: () => window.innerHeight });
     """
+    
+    # 检查是否存在持久化用户目录
+    user_data_dir = getattr(self, 'user_data_dir', None)
+    if user_data_dir and os.path.exists(user_data_dir):
+        print(f"使用持久化浏览器配置目录: {user_data_dir}")
+        use_persistent_context = True
+    else:
+        print("未找到持久化配置目录，使用临时浏览器上下文")
+        use_persistent_context = False
     
     # 自定义浏览器启动参数，模拟真实Chromium浏览器
     async with async_playwright() as p:
-        # 创建浏览器上下文，添加高级指纹特征
-        browser = await p.chromium.launch(
-            headless=False,  # 使用有头模式，方便排查问题
-            slow_mo=100 + random.randint(0, 100),  # 随机化操作速度
-            args=browser_args
-        )
-        
-        # 创建上下文，更完整的浏览器环境配置
-        context = await browser.new_context(
-            viewport={"width": width, "height": height},
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chromium/136.0.0.0 Safari/537.36",
-            locale="zh-CN",
-            timezone_id="Asia/Shanghai",
-            accept_downloads=True,
-            extra_http_headers={
-                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-                "accept-encoding": "gzip, deflate, br, zstd",
-                "accept-language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7,zh-CN;q=0.6",
-                "cache-control": "no-cache",
-                "pragma": "no-cache",
-                "sec-ch-ua": '"Chromium";v="136", "Not.A/Brand";v="99"',
-                "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": '"macOS"',
-                "sec-fetch-dest": "document",
-                "sec-fetch-mode": "navigate",
-                "sec-fetch-site": "none",
-                "sec-fetch-user": "?1",
-                "upgrade-insecure-requests": "1"
-            }
-        )
-        
-        # 设置cookies
-        await context.add_cookies(cookies)
-        
-        # 使用CDP直接设置cookie（更可靠的方法）
-        if self.zhihu_cookie and len(self.zhihu_cookie) > 0:
-            print("使用CDP直接设置cookie...")
-            cdp_session = await context.new_cdp_session(await context.new_page())
+        try:
+            answers = []
             
-            # 解析cookie字符串
-            for cookie_str in self.zhihu_cookie.split(';'):
-                if '=' in cookie_str:
-                    name, value = cookie_str.strip().split('=', 1)
-                    if name and value:
-                        # 使用CDP设置cookie
-                        try:
-                            await cdp_session.send('Network.setCookie', {
-                                'name': name,
-                                'value': value,
-                                'domain': '.zhihu.com',
-                                'path': '/',
-                                'secure': True,
-                                'httpOnly': False,
-                                'sameSite': 'None'
-                            })
-                            print(f"通过CDP设置cookie: {name}")
-                        except Exception as e:
-                            print(f"设置cookie {name} 失败: {str(e)}")
+            # 使用持久化上下文模式
+            if use_persistent_context:
+                print("使用持久化浏览器上下文模式...")
+                # 直接使用持久化上下文启动，保留所有cookie和存储
+                context = await p.chromium.launch_persistent_context(
+                    user_data_dir=user_data_dir,
+                    headless=False,
+                    slow_mo=50 + random.randint(0, 100),
+                    args=browser_args,
+                    viewport={"width": width, "height": height},
+                    user_agent=selected_ua,
+                    locale="zh-CN",
+                    timezone_id="Asia/Shanghai",
+                    accept_downloads=True,
+                    extra_http_headers={
+                        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                        "accept-encoding": "gzip, deflate, br, zstd",
+                        "accept-language": selected_lang,
+                        "cache-control": "max-age=" + str(random.randint(0, 300)),
+                        "sec-ch-ua": '"Chromium";v="' + str(110 + random.randint(0, 10)) + '", "Not.A/Brand";v="' + str(8 + random.randint(0, 10)) + '"',
+                        "sec-ch-ua-mobile": "?0",
+                        "sec-ch-ua-platform": '"macOS"',
+                        "sec-fetch-dest": "document",
+                        "sec-fetch-mode": "navigate",
+                        "sec-fetch-site": "none",
+                        "sec-fetch-user": "?1",
+                        "upgrade-insecure-requests": "1"
+                    }
+                )
+                browser = None  # 持久化上下文模式中不需要独立browser对象
+                
+            else:
+                # 非持久化模式，标准浏览器启动
+                print("使用非持久化浏览器模式...")
+                browser = await p.chromium.launch(
+                    headless=False,
+                    slow_mo=100 + random.randint(0, 150),
+                    args=browser_args
+                )
+                
+                # 创建上下文，更完整的浏览器环境配置
+                context = await browser.new_context(
+                    viewport={"width": width, "height": height},
+                    user_agent=selected_ua,
+                    locale="zh-CN",
+                    timezone_id="Asia/Shanghai",
+                    accept_downloads=True,
+                    extra_http_headers={
+                        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                        "accept-encoding": "gzip, deflate, br, zstd",
+                        "accept-language": selected_lang,
+                        "cache-control": "max-age=" + str(random.randint(0, 300)),
+                        "sec-ch-ua": '"Chromium";v="' + str(110 + random.randint(0, 10)) + '", "Not.A/Brand";v="' + str(8 + random.randint(0, 10)) + '"',
+                        "sec-ch-ua-mobile": "?0",
+                        "sec-ch-ua-platform": '"macOS"',
+                        "sec-fetch-dest": "document",
+                        "sec-fetch-mode": "navigate",
+                        "sec-fetch-site": "none",
+                        "sec-fetch-user": "?1",
+                        "upgrade-insecure-requests": "1"
+                    }
+                )
+                
+                # 设置cookies (仅在非持久化模式时)
+                if len(cookies) > 0:
+                    await context.add_cookies(cookies)
+                    print("非持久化模式：应用临时cookie")
             
-            # 关闭临时页面
-            await cdp_session.detach()
-        
-        # 创建新页面
-        page = await context.new_page()
-        
-        # 注入JS脚本来模拟真实浏览器环境，隐藏自动化特征
-        await page.add_init_script(anti_detection_js)
-        
-        # 模拟人类行为函数
-        async def simulate_human_behavior():
-            # 随机的鼠标移动
-            for i in range(3):
-                x = random.randint(100, width - 200)
-                y = random.randint(100, height - 200)
-                await page.mouse.move(x, y, steps=25)
-                await asyncio.sleep(0.5 + random.random() * 0.5)
+            # 创建新页面
+            page = await context.new_page()
             
-            # 随机的短暂停顿
-            await asyncio.sleep(1 + random.random() * 2)
-        
-        # 尝试模拟正常用户的浏览行为
-        print(f"正在直接打开问题页面: {question_url}")
-        
-        # 如果有cookie，先设置cookie
-        if self.zhihu_cookie:
-            # 创建一个空白页用于设置cookie
-            blank_page = await context.new_page()
-            await blank_page.goto("about:blank")
+            # 注入JS脚本来模拟真实浏览器环境，隐藏自动化特征
+            await page.add_init_script(anti_detection_js)
             
-            # 使用辅助函数设置cookie
+            # 模拟人类行为函数 - 增强版
+            async def simulate_human_behavior(page):
+                # 随机的鼠标移动
+                for i in range(random.randint(3, 7)):
+                    x = random.randint(100, width - 200)
+                    y = random.randint(100, height - 200)
+                    # 增加移动步数和随机性
+                    await page.mouse.move(x, y, steps=25 + random.randint(0, 20))
+                    await asyncio.sleep(0.3 + random.random() * 0.7)
+                
+                # 随机滚动
+                for i in range(random.randint(2, 5)):
+                    scroll_y = random.randint(100, 500)
+                    await page.evaluate(f"window.scrollBy(0, {scroll_y})")
+                    await asyncio.sleep(0.5 + random.random() * 1.5)
+                
+                # 随机点击页面空白处
+                if random.random() > 0.7:  # 30%概率执行
+                    try:
+                        click_x = random.randint(50, width - 100)
+                        click_y = random.randint(200, 500)
+                        await page.mouse.click(click_x, click_y)
+                    except:
+                        pass
+                
+                # 随机的短暂停顿
+                await asyncio.sleep(1 + random.random() * 3)
+            
+            # 先访问知乎首页，模拟正常浏览路径
             try:
-                current_cookies = await self.set_cookie_helper(blank_page, self.zhihu_cookie)
-                print(f"当前页面cookie: {current_cookies[:30]}...")
+                # 先访问知乎主页，然后再去问题页面，更符合正常用户行为
+                print("先访问知乎首页...")
+                await page.goto("https://www.zhihu.com", wait_until="domcontentloaded")
+                await asyncio.sleep(2 + random.random() * 3)
+                
+                # 模拟人类行为
+                await simulate_human_behavior(page)
+                
+                # 随机等待一段时间
+                wait_time = 2 + random.random() * 3
+                print(f"等待 {wait_time:.2f} 秒...")
+                await asyncio.sleep(wait_time)
+                
+                # 再访问问题页面
+                print(f"正在打开问题页面: {question_url}")
+                await page.goto(question_url, wait_until="domcontentloaded")
+                
+                # 等待页面加载完成
+                await asyncio.sleep(2 + random.random() * 3)
+                
+                # 模拟人类浏览行为
+                await simulate_human_behavior(page)
+                
+                # 收集回答数据
+                question_title = await page.title()
+                print(f"问题标题: {question_title}")
+                
+                # 滚动加载更多回答
+                for i in range(random.randint(4, 8)):
+                    # 随机滚动距离
+                    scroll_distance = random.randint(800, 1500)
+                    await page.evaluate(f"window.scrollBy(0, {scroll_distance})")
+                    
+                    # 随机等待加载
+                    await asyncio.sleep(1 + random.random() * 2)
+                    
+                    # 尝试点击展开回答
+                    expand_buttons = await page.query_selector_all("button.ContentItem-expandButton")
+                    if expand_buttons and random.random() > 0.3:  # 70%概率点击展开
+                        button_to_click = random.choice(expand_buttons)
+                        try:
+                            await button_to_click.click()
+                            await asyncio.sleep(0.5 + random.random() * 1)
+                        except:
+                            pass
+                
+                # 收集页面上的回答元素
+                answer_elements = await page.query_selector_all(".AnswerItem")
+                print(f"找到 {len(answer_elements)} 个回答")
+                answers = answer_elements
+                
             except Exception as e:
-                print(f"设置cookie失败: {str(e)}")
-                current_cookies = ""
-            
-            # 尝试设置localStorage
-            if "z_c0" in self.zhihu_cookie:
-                z_c0_value = re.search(r'z_c0=([^;]+)', self.zhihu_cookie)
-                if z_c0_value:
-                    token_value = z_c0_value.group(1)
-                    
-                    # 生成一个随机的SESSIONID如果不存在
-                    has_session_id = "SESSIONID=" in self.zhihu_cookie
-                    session_script = ""
-                    if not has_session_id:
-                        import uuid
-                        session_id = str(uuid.uuid4()).replace("-", "")
-                        session_script = f'document.cookie = "SESSIONID={session_id};domain=.zhihu.com;path=/;secure=true;httpOnly=true";'
-                        print(f"在localStorage设置时添加SESSIONID: {session_id[:8]}...")
-                    
-                    await blank_page.evaluate(f"""() => {{
-                        localStorage.setItem('z_c0', '{token_value}');
-                        localStorage.setItem('LOGIN_STATUS', '1');
-                        
-                        // 额外设置SESSIONID
-                        {session_script}
-                        
-                        // 设置XSRF Token (如果需要)
-                        const xsrfToken = Math.random().toString(36).slice(2);
-                        document.cookie = `_xsrf=${{xsrfToken}};domain=.zhihu.com;path=/`;
-                        localStorage.setItem('_xsrf', xsrfToken);
-                    }}""")
-                    print("已设置localStorage认证信息")
-            
-            # 关闭空白页
-            await blank_page.close()
-        
-        # 直接访问问题页面
-        await page.goto(question_url, wait_until="domcontentloaded")
-        
-        # 完整的页面处理操作...省略部分代码，使用从原文件导入
-        
-        # 关闭浏览器
-        await browser.close()
+                print(f"浏览过程中发生错误: {str(e)}")
+                answers = []
+                
+        finally:
+            # 确保关闭浏览器
+            try:
+                if browser:
+                    await browser.close()
+                else:
+                    await context.close()
+            except:
+                pass
         
         return len(answers) 
